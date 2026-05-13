@@ -71,6 +71,7 @@ class CircuitBreaker:
         if self.state == CircuitState.HALF_OPEN and self.success_count >= self.success_threshold:
             self._transition(CircuitState.CLOSED, "probe_success")
             self.success_count = 0
+            self.opened_at = None
 
     def record_failure(self) -> None:
         """Record failure and open when threshold is reached."""
@@ -80,6 +81,7 @@ class CircuitBreaker:
         if self.state == CircuitState.HALF_OPEN or self.failure_count >= self.failure_threshold:
             self._transition(CircuitState.OPEN, "failure_threshold")
             self.opened_at = time.monotonic()
+            self.failure_count = 0
 
     def _transition(self, new_state: CircuitState, reason: str) -> None:
         if self.state == new_state:

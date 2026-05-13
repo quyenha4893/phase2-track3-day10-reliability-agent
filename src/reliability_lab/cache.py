@@ -4,6 +4,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -55,7 +56,10 @@ class ResponseCache:
         self._entries: list[CacheEntry] = []
 
     def get(self, query: str) -> tuple[str | None, float]:
+        if _is_uncacheable(query):
+            return None, 0.0
         best_value: str | None = None
+        best_key: str | None = None
         best_score = 0.0
         now = time.time()
         self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
@@ -63,12 +67,17 @@ class ResponseCache:
             score = self.similarity(query, entry.key)
             if score > best_score:
                 best_score = score
+                best_key = entry.key
                 best_value = entry.value
+        if best_key is not None and _looks_like_false_hit(query, best_key):
+            return None, best_score
         if best_score >= self.similarity_threshold:
             return best_value, best_score
         return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
+        if _is_uncacheable(query):
+            return
         self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
 
     @staticmethod
@@ -81,7 +90,9 @@ class ResponseCache:
         right = set(b.lower().split())
         if not left or not right:
             return 0.0
-        return len(left & right) / len(left | right)
+        jaccard = len(left & right) / len(left | right)
+        sequence = SequenceMatcher(None, a.lower(), b.lower()).ratio()
+        return (jaccard * 0.7) + (sequence * 0.3)
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +157,34 @@ class SharedRedisCache:
         7. Before returning a match, check _looks_like_false_hit(); if true,
            append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        if _is_uncacheable(query):
+            return None, 0.0
+
+        exact_key = f"{self.prefix}{self._query_hash(query)}"
+        exact_response = self._redis.hget(exact_key, "response")
+        if exact_response is not None:
+            return str(exact_response), 1.0
+
+        best_response: str | None = None
+        best_query: str | None = None
+        best_score = 0.0
+        for key in self._redis.scan_iter(f"{self.prefix}*"):
+            cached_query = self._redis.hget(key, "query")
+            cached_response = self._redis.hget(key, "response")
+            if cached_query is None or cached_response is None:
+                continue
+            score = ResponseCache.similarity(query, str(cached_query))
+            if score > best_score:
+                best_score = score
+                best_query = str(cached_query)
+                best_response = str(cached_response)
+
+        if best_query is not None and _looks_like_false_hit(query, best_query):
+            self.false_hit_log.append({"query": query, "cached_key": best_query, "score": best_score})
+            return None, best_score
+        if best_response is not None and best_score >= self.similarity_threshold:
+            return best_response, best_score
+        return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -157,7 +195,14 @@ class SharedRedisCache:
         3. self._redis.hset(key, mapping={"query": query, "response": value})
         4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        if _is_uncacheable(query):
+            return
+        key = f"{self.prefix}{self._query_hash(query)}"
+        mapping = {"query": query, "response": value}
+        if metadata:
+            mapping.update({f"metadata:{k}": v for k, v in metadata.items()})
+        self._redis.hset(key, mapping=mapping)
+        self._redis.expire(key, self.ttl_seconds)
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""
